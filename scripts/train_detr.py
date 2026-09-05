@@ -1,9 +1,44 @@
 import argparse
+import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "ultralytics-git"))
+
+from torch import distributed as dist
+
 from ultralytics import RTDETR
+from ultralytics.models.rtdetr.train import RTDETRTrainer
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.utils import LOGGER
+from ultralytics.utils.torch_utils import init_seeds
+
+
+class ValLossEarlyStopRTDETRTrainer(RTDETRTrainer):
+    """Use negative validation total loss as early-stopping fitness."""
+
+    def validate(self):
+        if self.ema and self.world_size > 1:
+            for buffer in self.ema.ema.buffers():
+                dist.broadcast(buffer, src=0)
+        metrics = self.validator(self)
+        if metrics is None:
+            return None, None
+
+        detection_fitness = metrics.pop("fitness", None)
+        keys = ("val/giou_loss", "val/cls_loss", "val/l1_loss")
+        missing = [key for key in keys if key not in metrics]
+        if missing:
+            raise KeyError(f"Validation-loss early stopping requires metrics {keys}, missing {missing}.")
+
+        val_total_loss = sum(float(metrics[key]) for key in keys)
+        metrics["val/total_loss"] = round(val_total_loss, 5)
+        if detection_fitness is not None:
+            metrics["fitness/detection"] = round(float(detection_fitness), 5)
+        fitness = -val_total_loss
+        if self.best_fitness is None or self.best_fitness == 0 or self.best_fitness < fitness:
+            self.best_fitness = fitness
+        return metrics, fitness
 
 
 def parse_pretrained_arg(value: str | None):
@@ -67,6 +102,7 @@ def parse_args():
     parser.add_argument("--lrf", type=float, default=0.01, help="Final learning rate factor")
     parser.add_argument("--momentum", type=float, default=0.937, help="Momentum for optimizer")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="Weight decay for optimizer")
+    parser.add_argument("--warmup_epochs", type=float, default=3.0, help="Warmup duration in epochs")
     parser.add_argument("--warmup_bias_lr", type=float, default=0.0, help="Warmup learning rate for bias parameters")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False, help="Enable automatic mixed precision")
     parser.add_argument("--fraction", type=float, default=1.0, help="Dataset fraction to use for training")
@@ -74,6 +110,13 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=8, help="Number of workers for data loading")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--deterministic", action="store_true", default=False, help="Enable deterministic training for reproducibility")
+    parser.add_argument(
+        "--early-stop-metric",
+        type=str,
+        default="fitness",
+        choices=["fitness", "val_loss"],
+        help="Early stopping target: default detection fitness or negative RT-DETR validation total loss.",
+    )
     parser.add_argument("--iou_type", type=str, default="giou",
                         choices=["ciou", "diou", "giou", "siou", "inner_ciou", "inner_siou"],
                         help="IoU loss type for bounding box regression")
@@ -100,6 +143,7 @@ if __name__ == "__main__":
     args = parse_args()
     resume = parse_resume_arg(args.resume)
     model_path, resume = resolve_resume_strategy(str(Path(args.model)), resume, args.epochs)
+    init_seeds(args.seed, deterministic=args.deterministic)
     yolo = RTDETR(model_path)
     train_kwargs = dict(
         data=args.dataset_path,
@@ -115,6 +159,7 @@ if __name__ == "__main__":
         lrf=args.lrf,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
+        warmup_epochs=args.warmup_epochs,
         warmup_bias_lr=args.warmup_bias_lr,
         amp=args.amp,
         fraction=args.fraction,
@@ -134,6 +179,7 @@ if __name__ == "__main__":
         train_kwargs["pretrained"] = pretrained
     if resume is not None:
         train_kwargs["resume"] = resume
-    yolo.train(**train_kwargs)
+    trainer = ValLossEarlyStopRTDETRTrainer if args.early_stop_metric == "val_loss" else None
+    yolo.train(trainer=trainer, **train_kwargs)
 
     # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")

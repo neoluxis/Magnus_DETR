@@ -1,5 +1,5 @@
 # Historical b5 architecture with an equation-exact HF-SCC placement switch.
-# train.py rewrites the placement and TorchVision weight source per run.
+# scripts/run_hfscc_placement_0905.py rewrites the placement per run.
 nc: 1
 scales:
   l: [1.00, 1.00, 1024]
@@ -25,9 +25,9 @@ head:
   - [-1, 1, Conv, [256, 1, 1]]
 
   - [6, 1, Conv, [256, 1, 1, null, 1, 1, False]]
-  - [-1, 1, MDHIFI, [256, 2048, 8, 3, 5, 4]]
+  - [-1, 1, MDHIFI, [2048, 8, 3, 5, 4]]
   - [3, 1, Conv, [256, 1, 1, null, 1, 1, False]]
-  - [-1, 1, MDHIFI, [256, 2048, 8, 3, 5, 4]]
+  - [-1, 1, MDHIFI, [2048, 8, 3, 5, 4]]
   - [12, 1, Conv, [256, 1, 1, null, 1, 1, False]]
 
   # args: cm, smooth_kernel, align_mode, noise_suppression, p3_gate, placement, gamma_init

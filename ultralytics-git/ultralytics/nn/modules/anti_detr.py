@@ -23,6 +23,7 @@ __all__ = (
     "DWGConvSA",
     "DynamicWTConv2d",
     "HFSCC",
+    "HFSCCPlacement",
     "HIFI",
     "LayerNorm",
     "LiteMDHIFI",
@@ -1163,16 +1164,29 @@ class _CompensationHead(nn.Module):
         return self.net(x)
 
 
-class HFSCC(nn.Module):
-    def __init__(self, c1, cm=4, smooth_kernel=3, align_mode="shift", use_noise_suppression=True, use_p3_gate=True):
+class HFSCCPlacement(nn.Module):
+    def __init__(
+        self,
+        c1,
+        cm=4,
+        smooth_kernel=3,
+        align_mode="shift",
+        use_noise_suppression=True,
+        use_p3_gate=True,
+        placement="correction",
+        gamma_init=1e-2,
+    ):
         super().__init__()
         if align_mode != "shift":
-            raise ValueError(f"HFSCC only supports align_mode='shift', but got {align_mode!r}.")
+            raise ValueError(f"HFSCCPlacement only supports align_mode='shift', but got {align_mode!r}.")
+        if placement not in {"receiver", "joint", "correction", "ungated"}:
+            raise ValueError(f"Unsupported HFSCC placement {placement!r}.")
 
         hidden = max(int(c1 // max(cm, 1)), 8)
         pair_channels = c1 * 4
         self.use_noise_suppression = use_noise_suppression
         self.use_p3_gate = use_p3_gate
+        self.placement = placement
         self.smooth3 = _DepthwiseSmoothing(c1, smooth_kernel)
         self.smooth4 = _DepthwiseSmoothing(c1, smooth_kernel)
         self.smooth5 = _DepthwiseSmoothing(c1, smooth_kernel)
@@ -1208,13 +1222,28 @@ class HFSCC(nn.Module):
             self.noise5 = _CompensationHead(pair_channels, c1)
             self.beta4 = nn.Parameter(torch.zeros(1, c1, 1, 1))
             self.beta5 = nn.Parameter(torch.zeros(1, c1, 1, 1))
-        self.gamma3 = nn.Parameter(torch.full((1, c1, 1, 1), 1e-2))
-        self.gamma4 = nn.Parameter(torch.full((1, c1, 1, 1), 1e-2))
-        self.gamma5 = nn.Parameter(torch.full((1, c1, 1, 1), 1e-2))
+        self.gamma3 = nn.Parameter(torch.full((1, c1, 1, 1), gamma_init))
+        self.gamma4 = nn.Parameter(torch.full((1, c1, 1, 1), gamma_init))
+        self.gamma5 = nn.Parameter(torch.full((1, c1, 1, 1), gamma_init))
 
     @staticmethod
     def _pair_features(aligned, current):
         return torch.cat([aligned, current, torch.abs(aligned - current), aligned * current], dim=1)
+
+    @staticmethod
+    def _ones_like(gate):
+        return torch.ones_like(gate)
+
+    def _fuse(self, feature, gate, delta, gamma, gated=True):
+        if not gated:
+            gate = self._ones_like(gate)
+        if self.placement == "receiver":
+            return gate * feature + gamma * delta
+        if self.placement == "joint":
+            return gate * (feature + gamma * delta)
+        if self.placement == "correction":
+            return feature + gamma * gate * delta
+        return feature + gamma * delta
 
     def forward(self, x):
         f3, f4, f5 = x
@@ -1239,12 +1268,9 @@ class HFSCC(nn.Module):
         d4 = self.delta4(e4)
         d5 = self.delta5(e5)
 
-        if use_p3_gate:
-            p3 = f3 + self.gamma3 * c3 * d3
-        else:
-            p3 = f3 + self.gamma3 * d3
-        p4 = f4 + self.gamma4 * c4 * d4
-        p5 = f5 + self.gamma5 * c5 * d5
+        p3 = self._fuse(f3, c3, d3, self.gamma3, gated=use_p3_gate)
+        p4 = self._fuse(f4, c4, d4, self.gamma4)
+        p5 = self._fuse(f5, c5, d5, self.gamma5)
 
         if use_noise_suppression:
             n4 = self.noise4(e4)
@@ -1253,3 +1279,17 @@ class HFSCC(nn.Module):
             p5 = p5 - self.beta5 * (1.0 - c5) * n5
 
         return [p3, p4, p5]
+
+
+class HFSCC(HFSCCPlacement):
+    def __init__(self, c1, cm=4, smooth_kernel=3, align_mode="shift", use_noise_suppression=True, use_p3_gate=True):
+        super().__init__(
+            c1,
+            cm=cm,
+            smooth_kernel=smooth_kernel,
+            align_mode=align_mode,
+            use_noise_suppression=use_noise_suppression,
+            use_p3_gate=use_p3_gate,
+            placement="correction",
+            gamma_init=1e-2,
+        )

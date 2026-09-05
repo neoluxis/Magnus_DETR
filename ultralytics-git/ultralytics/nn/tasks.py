@@ -83,6 +83,7 @@ from ultralytics.nn.modules import (
     Segment26,
     SemanticSegment,
     HFSCC,
+    HFSCCPlacement,
     HIFI,
     LayerNorm,
     LiteMDHIFI,
@@ -1815,7 +1816,7 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f], *args]
         elif m in {HIFI, MDHIFI, LiteMDHIFI}:
             args = [ch[f], *args]
-        elif m is HFSCC:
+        elif m in {HFSCC, HFSCCPlacement}:
             c2 = ch[f[0]]
             args = [c2, *args]
         elif m in frozenset({HGStem, HGBlock}):
