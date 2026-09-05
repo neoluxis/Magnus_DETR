@@ -19,6 +19,8 @@ __all__ = (
     "Conv2d_BN",
     "ConvNormLayer",
     "DWGConv",
+    "DWGConvMS",
+    "DWGConvSA",
     "DynamicWTConv2d",
     "HFSCC",
     "HIFI",
@@ -485,6 +487,112 @@ class DWGConv(nn.Module):
         out = out * self.gate(out)
         out = self.proj(out)
         return out + self.short(x)
+
+
+class DWGConvSA(nn.Module):
+    """Depth-wise Gated Convolution with Spatial Attention for P2 noise suppression.
+
+    Extends DWGConv with a CBAM-style spatial attention gate after the channel SE gate.
+    The spatial gate selectively suppresses noisy spatial regions, complementing the
+    channel-wise gating. This directly targets P2's core problem: high-frequency noise
+    is spatially localized, but SE applies a uniform per-channel scalar globally.
+
+    Spatial gate pattern reused from SparseGlobalAttention.spatial_gate (line 443-446):
+        concat(avg_pool, max_pool) -> Conv2d(2, 1, 7) -> Sigmoid
+
+    Architecture:
+        x -> DWConv(3x3) -> ChannelGate(SE) -> SpatialGate(7x7) -> Proj(1x1) ─┬─> out
+        x ───────────────────────────────────────────────> Short(1x1) ─────────┘
+    """
+
+    def __init__(self, c1, c2, k=3, reduction=4, spatial_kernel=7):
+        super().__init__()
+        self.dwconv = nn.Conv2d(c1, c1, k, padding=k // 2, groups=c1, bias=False)
+        hidden = max(c1 // reduction, 8)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c1, hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        # Spatial attention: avg+max pooled maps -> 7x7 conv -> spatial mask
+        # Pattern from SparseGlobalAttention.spatial_gate (anti_detr.py:443-446)
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(2, 1, spatial_kernel, padding=spatial_kernel // 2, bias=False),
+            nn.Sigmoid(),
+        )
+        self.proj = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
+        self.short = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        out = self.dwconv(x)
+        out = out * self.gate(out)  # channel attention
+        # spatial attention
+        avg_map = out.mean(dim=1, keepdim=True)
+        max_map = out.amax(dim=1, keepdim=True)
+        spatial_mask = self.spatial_gate(torch.cat([avg_map, max_map], dim=1))
+        out = out * spatial_mask
+        out = self.proj(out)
+        return out + self.short(x)
+
+
+class DWGConvMS(nn.Module):
+    """Multi-scale Depth-wise Gated Convolution with content-adaptive kernel blending.
+
+    Uses two parallel DWConv branches (3x3 and 5x5 dilated) with a learned gate
+    that blends them per-channel based on input content. Designed for P2 noise
+    suppression: the 3x3 branch preserves fine spatial detail while the 5x5-dilated
+    branch provides larger-context noise smoothing.
+
+    Key design choices (all with codebase precedent):
+    - Branch gate reuses DynamicWTConv2d.gate pattern (line 726-731):
+      GAP -> FC -> ReLU -> FC -> 2C -> Sigmoid -> chunk(2), gating two branches.
+    - BN after fusion stabilizes gated output distribution.
+    - Large-kernel path uses learnable scale init=0.1 for gradual activation
+      (_ScaleModule pattern, line 584-590).
+    - Residual scale init=0.1 for gradual noise suppression learning
+      (HFSCC gamma pattern, line 1103-1105).
+
+    Architecture:
+                     -> DWConv(3x3) ──────────────────┐
+        x -> Gate(x) ->                               (+) -> BN -> Proj(1x1) ─┬─> out
+                     -> DWConv(5x5, d=2) -> *scale ───┘                       │
+        x ────────────────────────────────────> Short(1x1) -> *res_scale ─────┘
+    """
+
+    def __init__(self, c1, c2, k_small=3, k_large=5, reduction=4):
+        super().__init__()
+        self.dwconv_small = nn.Conv2d(c1, c1, k_small, padding=k_small // 2, groups=c1, bias=False)
+        self.dwconv_large = nn.Conv2d(
+            c1, c1, k_large, padding=autopad(k_large, d=2), dilation=2, groups=c1, bias=False
+        )
+        # Branch gate: content-adaptive blend of two kernel sizes
+        # Pattern: DynamicWTConv2d.gate (anti_detr.py:726-731)
+        hidden = max(c1 // reduction, 8)
+        self.branch_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c1, hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c1 * 2, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        # Gradual activation for large-kernel path (_ScaleModule pattern)
+        self.large_scale = nn.Parameter(torch.full((1, c1, 1, 1), 0.1))
+        self.bn = nn.BatchNorm2d(c1)
+        self.proj = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
+        self.short = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
+        # Gradual residual learning (HFSCC gamma pattern, line 1103)
+        self.residual_scale = nn.Parameter(torch.full((1, c2, 1, 1), 0.1))
+
+    def forward(self, x):
+        out_small = self.dwconv_small(x)
+        out_large = self.dwconv_large(x) * self.large_scale
+        gate_small, gate_large = self.branch_gate(x).chunk(2, dim=1)
+        out = out_small * gate_small + out_large * gate_large
+        out = self.bn(out)
+        out = self.proj(out)
+        return out + self.short(x) * self.residual_scale
 
 
 def create_wavelet_filter(wave, in_size, out_size, type=torch.float):

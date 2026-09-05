@@ -433,6 +433,7 @@ class DetectionValidator(BaseValidator):
                 {
                     "image_id": image_id,
                     "file_name": path.name,
+                    "image_path": str(path),
                     "category_id": self.class_map[int(c)],
                     "bbox": [round(x, 3) for x in b],
                     "score": round(s, 5),

@@ -8,8 +8,9 @@
 __all__ = (
     "Attention_histogram", "BasicBlock", "BasicBlock_DGWRN", "BasicBlock_WTConv",
     "BiAGCAUBlock", "BottleNeck", "BottleNeck_WTConv", "Blocks", "Conv2d_BN",
-    "ConvNormLayer", "DWGConv", "DynamicWTConv2d", "HFSCC", "HIFI", "LayerNorm",
-    "LiteMDHIFI", "MDHIFI", "SparseGlobalAttention", "WTConv2d",
+    "ConvNormLayer", "DWGConv", "DWGConvMS", "DWGConvSA", "DynamicWTConv2d",
+    "HFSCC", "HIFI", "LayerNorm", "LiteMDHIFI", "MDHIFI",
+    "SparseGlobalAttention", "WTConv2d",
 )
 ```
 
@@ -147,15 +148,75 @@ branch_2a (3x3 ConvNorm) → branch2b (3x3 ConvNorm) → +shortcut → Act
 
 ---
 
-## 六、DWGConv — 深度可分离门控卷积
+## 六、DWGConv 系列 — 深度可分离门控卷积
 
-**用途**: 轻量级 P2 特征降噪块。用于 FPN 中 P2 特征投影后抑制高频噪声。
+P2 高分辨率特征（1/4 输入）的噪声抑制模块。P2 来自 SwinV2-T 浅层 stage，携带丰富细节但也包含高频噪声。P3/P4 使用 MDHIFI 做增强降噪，但 P2 因分辨率高不宜使用重计算模块，因此设计轻量 DWGConv 系列。
+
+共有三个变体，按复杂度递增：
+
+### DWGConv（原版）
+
+**用途**: 基础轻量 P2 降噪块。
 
 ```
 输入 x
   ├── DWConv(3x3, groups=C) → SE-Gate → Proj(1x1) → out
   └── Short(1x1) ──────────────────────────────────→ +
 ```
+
+**可视化注意**: `SE-Gate` 输出为全局通道权重 `[B, C, 1, 1]`，不携带空间分布信息，因此不应画成空间注意力热图。更合适的是：
+
+- 按场景分组的通道门控条形图
+- 门控权重分布图
+- 云层、建筑、植被、天空等场景下的统计对比
+
+### DWGConvSA — 空间注意力增强 ★
+
+**用途**: 在 DWGConv 基础上增加空间维度注意力。P2 噪声是空间局部的，SE-Gate 只能做通道级全局加权，无法区分同一通道中的噪声区域和干净区域。SpatialGate 通过学习空间位置的重要性来精准抑噪。
+
+**代码库先例**: `SparseGlobalAttention.spatial_gate` (line 443-446)
+
+```
+输入 x
+  ├── DWConv(3x3, groups=C) → ChannelGate(SE)
+  │         → SpatialGate(avg+max → Conv7x7 → Sigmoid) → Proj(1x1) → out
+  └── Short(1x1) ──────────────────────────────────────────────────────→ +
+```
+
+**参数量增加**: +98 (Conv2d 2→1, 7×7)
+
+**可视化注意**:
+
+- `gate` 仍然是全局通道系数，应继续使用条形图或分布图展示
+- 只有 `spatial_gate` 生成的 `[B, 1, H, W]` 掩码适合画成空间热图
+
+### DWGConvMS — 多尺度自适应门控 ★
+
+**用途**: 双分支 DWConv（3×3 + 5×5 dilated）+ 内容自适应门控。3×3 分支保留细节，5×5 分支提供大感受野平滑噪声。BranchGate 按输入内容动态分配两支路权重，配合 BN 稳定门控分布，残差 scale 渐进学习降噪强度。
+
+**代码库先例**: `DynamicWTConv2d.gate` (双分支门控), `HFSCC.gamma` (小值初始化渐进学习)
+
+```
+                     → DWConv(3x3) ──────────────────┐
+x → BranchGate(x) →                                  (+) → BN → Proj(1x1) ─┬─→ out
+                     → DWConv(5x5, d=2) → *scale ────┘                     │
+x ────────────────────────────────────→ Short(1x1) → *res_scale ───────────┘
+```
+
+- BranchGate: `GAP → FC → ReLU → FC → 2C → Sigmoid → chunk(2)`，产生 small/large 两支路各自的通道权重
+- 5×5 dilated 分支: `_ScaleModule(init_scale=0.1)` 渐进激活
+- 残差路径: `residual_scale(init=0.1)` 让模型从接近无残差开始，逐步学习最佳降噪强度
+- BN 在分支融合后稳定门控输出分布
+
+**参数量增加**: +24,064
+
+**可视化注意**: `BranchGate` 输出为 `[B, 2C, 1, 1]`，分别对应 small/large 两个分支的全局通道权重。建议展示：
+
+- small 分支与 large 分支的场景均值条形图
+- 两个分支各自的权重分布
+- 不同场景条件下的分支偏置差异
+
+不建议把 `BranchGate` 直接渲染为空间热图。
 
 ---
 
@@ -230,6 +291,12 @@ branch2a: 3x3 ConvNormLayer
 - `grad` (Sobel): 强化边缘与轮廓特征
 - `texture` (局部差分): 强化局部纹理变化
 - `noise_gate`: 自适应抑制噪声区域的增强
+
+**可视化注意**: `noise_gate` 输出形状为 `[B, C, H, W]`，保留空间维度，因此可以合法地绘制空间 Gate 热图。建议同时报告：
+
+- 通道均值后的空间 gate map
+- 同一目标框下的 `Target-to-Clutter Response Ratio (TCRR)`
+- baseline / HIFI / MDHIFI 的并列对比
 
 ### LiteMDHIFI — 轻量多维 HIFI
 
@@ -309,6 +376,12 @@ branch2a: 3x3 ConvNormLayer
 - `use_noise_suppression`: 是否启用噪声抑制
 - `use_p3_gate`: P3 是否使用一致性门控
 
+**可视化注意**: HFSCC 的首选证据不是 CAM，而是直接可视化跨尺度一致性图 `C_{i,i+1}`，即 `c4/c5`（必要时附 `c3`）。展示重点应是：
+
+- 目标区域得到补偿增强
+- 无跨尺度支持的背景杂波被 `(1 - c_i)` 抑制
+- 图下注明 TCRR，而不是只凭“看起来更亮”
+
 ---
 
 ## 十一、模块依赖关系图
@@ -333,7 +406,11 @@ BiAGCAUBlock → _AGCAUUnit + SparseGlobalAttention
 HFSCC → _DepthwiseSmoothing + _ShiftAlign + _CompensationHead
 
 SparseGlobalAttention → _ChannelGate
-DWGConv (独立使用的轻量降噪块)
+
+DWGConv 系列 (P2 轻量降噪):
+  ├── DWGConv (基础: DWConv + SE-Gate + Residual)
+  ├── DWGConvSA (SE-Gate + SpatialGate, 复用 SparseGlobalAttention 的空间注意力模式)
+  └── DWGConvMS (双分支 + BranchGate + BN + 渐进残差, 复用 DynamicWTConv2d.gate 和 HFSCC.gamma 模式)
 ```
 
 ## 注意事项

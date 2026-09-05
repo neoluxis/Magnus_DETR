@@ -24,6 +24,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--deterministic", action="store_true", default=False, help="Enable deterministic training for reproducibility")
     parser.add_argument("--pretrained", action="store_true", default=True, help="Use pretrained weights")
+    parser.add_argument("--iou_type", type=str, default="ciou",
+                        choices=["ciou", "diou", "giou", "siou", "inner_ciou", "inner_siou"],
+                        help="IoU loss type for bounding box regression")
+    parser.add_argument("--inner_ratio", type=float, default=0.75,
+                        help="Inner box scale factor for inner_iou variants (0.0-1.0)")
     parser.add_argument("--close_mosaic", type=int, default=10, help="Close mosaic augmentation N epochs before end")
     parser.add_argument("--exist-ok", action="store_true", default=False, help="Allow overwriting an existing run directory")
     return parser.parse_args()
@@ -52,6 +57,8 @@ if __name__ == "__main__":
         seed=args.seed,
         deterministic=args.deterministic,
         pretrained=args.pretrained,
+        iou_type=args.iou_type,
+        inner_ratio=args.inner_ratio,
         close_mosaic=args.close_mosaic,
         exist_ok=args.exist_ok,
         mosaic=False,  ## 加速训练 4.5min/epoch -> 1min/epoch

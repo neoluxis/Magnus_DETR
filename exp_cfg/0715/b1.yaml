@@ -1,0 +1,72 @@
+# B1: 损失函数改进验证 (CST 数据集)
+# 网络结构与 b0 (0705/b5 基线) 完全一致
+# 验证损失: Inner-SIoU, Inner-CIoU (通过 CLI --iou_type 指定)
+
+# Parameters
+nc: 80 # number of classes
+scales:
+  # [depth, width, max_channels]
+  l: [1.00, 1.00, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, TorchVision, [768, swin_v2_t, DEFAULT, True, 2, True]] # 0 torchvision backbone, split outputs enabled
+  - [0, 1, Index, [192, 3]] # 1 stage2 -> P3/8 (NHWC)
+  - [-1, 1, Permute, [0, 3, 1, 2]] # 2 P3 -> NCHW
+  - [-1, 1, EMA, [192]] # 3 P3 attention
+  - [0, 1, Index, [384, 5]] # 4 stage3 -> P4/16 (NHWC)
+  - [-1, 1, Permute, [0, 3, 1, 2]] # 5 P4 -> NCHW
+  - [-1, 1, EMA, [384]] # 6 P4 attention
+  - [0, 1, Index, [768, 7]] # 7 stage4 -> P5/32 (NHWC)
+  - [-1, 1, Permute, [0, 3, 1, 2]] # 8 P5 -> NCHW
+  - [-1, 1, EMA, [768]] # 9 P5 attention
+  - [0, 1, Index, [96, 1]] # 10 stage1 -> P2/4 (NHWC)
+  - [-1, 1, Permute, [0, 3, 1, 2]] # 11 P2 -> NCHW
+  - [-1, 1, EMA, [96]] # 12 P2 attention
+
+head:
+  - [9, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 13 P5 proj
+  - [-1, 1, AIFI, [1024, 8]] # 14
+  - [-1, 1, Conv, [256, 1, 1]] # 15 Y5
+
+  - [6, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 16 P4 proj
+  - [-1, 1, MDHIFI, [2048, 8, 3, 5, 4]] # 17 P4m
+
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 18 P3 proj
+  - [-1, 1, MDHIFI, [2048, 8, 3, 5, 4]] # 19 P3m
+
+  - [12, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 20 P2 proj (96->256, no MDHIFI)
+
+  - [[19, 17, 15], 1, HFSCC, [4, 3, "shift", True]] # 21 -> P3c, P4c, P5c
+  - [21, 1, Index, [256, 0]] # 22 P3c
+  - [21, 1, Index, [256, 1]] # 23 P4c
+  - [21, 1, Index, [256, 2]] # 24 P5c
+
+  # FPN (top-down)
+  - [24, 1, nn.Upsample, [None, 2, "nearest"]] # 25
+  - [[-1, 23], 1, Concat, [1]] # 26 P5c_up + P4c
+  - [-1, 3, RepC3, [256]] # 27 Y4
+  - [-1, 1, Conv, [256, 1, 1]] # 28 Y4_proj
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 29
+  - [[-1, 22], 1, Concat, [1]] # 30 Y4_up + P3c
+  - [-1, 3, RepC3, [256]] # 31 Y3
+  - [-1, 1, Conv, [256, 1, 1]] # 32 Y3_proj
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 33
+  - [[-1, 20], 1, Concat, [1]] # 34 Y3_up + P2 (proj only, no MDHIFI)
+  - [-1, 3, RepC3, [256]] # 35 P2_out
+
+  # PAN (bottom-up) — P3c/P4c 重复注入保留
+  - [-1, 1, Conv, [256, 3, 2, None, 1, 1, False]] # 36 P2_out stride2
+  - [[-1, 32, 22], 1, Concat, [1]] # 37 P2_down + Y3_proj + P3c
+  - [-1, 3, RepC3, [256]] # 38 P3_out
+
+  - [-1, 1, Conv, [256, 3, 2, None, 1, 1, False]] # 39 P3_out stride2
+  - [[-1, 28, 23], 1, Concat, [1]] # 40 P3_down + Y4_proj + P4c
+  - [-1, 3, RepC3, [256]] # 41 P4_out
+
+  # P5检测头移除: decoder仅使用P2/P3/P4
+  # P5仍通过AIFI(#14)提供语义信息，通过HFSCC(#21)提供校准信息
+
+  - [[35, 38, 41], 1, RTDETRDecoder, [nc]] # 42 Detect(P2_out, P3_out, P4_out)
