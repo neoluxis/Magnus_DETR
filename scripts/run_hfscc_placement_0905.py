@@ -13,7 +13,7 @@ PLACEMENTS = ("receiver", "joint", "correction", "ungated")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run the 0905 HFSCC placement ablation serially.")
+    parser = argparse.ArgumentParser(description="Run the 0905 HFSCC placement ablation.")
     parser.add_argument("--base-yaml", type=Path, default=Path("exp_cfg/0905/rtdetr_swinv2_tiny_b5.yaml"))
     parser.add_argument(
         "--dataset-path",
@@ -23,9 +23,21 @@ def parse_args():
     parser.add_argument("--project", type=Path, default=Path("runs/detect/0905"))
     parser.add_argument("--generated-config-dir", type=Path, default=Path("runs/detect/0905/_generated_cfg"))
     parser.add_argument("--device", type=str, default="0")
+    parser.add_argument(
+        "--placement",
+        choices=PLACEMENTS,
+        default=None,
+        help="Run only one placement. Omit to run all placements serially.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands and generated configs without training.")
     parser.add_argument("--exist-ok", action="store_true", help="Allow Ultralytics to reuse existing run directories.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.base_yaml = args.base_yaml if args.base_yaml.is_absolute() else ROOT / args.base_yaml
+    args.project = args.project if args.project.is_absolute() else ROOT / args.project
+    args.generated_config_dir = (
+        args.generated_config_dir if args.generated_config_dir.is_absolute() else ROOT / args.generated_config_dir
+    )
+    return args
 
 
 def write_variant_config(base_yaml, output_dir, placement):
@@ -43,7 +55,7 @@ def write_variant_config(base_yaml, output_dir, placement):
 def build_command(args, placement, config_path):
     command = [
         sys.executable,
-        "scripts/train_detr.py",
+        str(ROOT / "scripts/train_detr.py"),
         "--model",
         str(config_path),
         "--dataset_path",
@@ -90,7 +102,8 @@ def main():
     args.generated_config_dir.mkdir(parents=True, exist_ok=True)
 
     commands = []
-    for placement in PLACEMENTS:
+    placements = (args.placement,) if args.placement else PLACEMENTS
+    for placement in placements:
         config_path = write_variant_config(args.base_yaml, args.generated_config_dir, placement)
         command = build_command(args, placement, config_path)
         commands.append((placement, config_path, command))
